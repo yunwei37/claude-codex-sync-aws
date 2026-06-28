@@ -1,0 +1,11 @@
+[Unit]
+Description=Back up Claude Code and Codex CLI chat history to AWS S3 with restic
+Documentation=https://github.com/yunwei37/claude-codex-sync-aws
+
+[Service]
+Type=oneshot
+EnvironmentFile=-%h/.config/claude-codex-sync-aws/env
+ExecStart=%h/.local/bin/claude-codex-sync-aws backup
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

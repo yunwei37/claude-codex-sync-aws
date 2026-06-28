@@ -1,0 +1,11 @@
+[Unit]
+Description=Weekly Claude/Codex chat history backup
+
+[Timer]
+OnCalendar=Sun *-*-* 03:30:00
+Persistent=true
+RandomizedDelaySec=2h
+Unit=claude-codex-sync-aws.service
+
+[Install]
+WantedBy=timers.target

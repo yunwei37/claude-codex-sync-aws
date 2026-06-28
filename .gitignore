@@ -1,0 +1,7 @@
+/.env
+/.restic-password
+/tmp/
+*.log
+*.tar
+*.tar.gz
+*.tar.zst

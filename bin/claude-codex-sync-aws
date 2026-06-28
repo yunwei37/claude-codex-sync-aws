@@ -1,0 +1,390 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+APP_NAME="claude-codex-sync-aws"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/${APP_NAME}"
+ENV_FILE="${CLAUDE_CODEX_SYNC_AWS_ENV:-${CONFIG_DIR}/env}"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/${APP_NAME}"
+LOCK_FILE="${XDG_RUNTIME_DIR:-/tmp}/${APP_NAME}.lock"
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  claude-codex-sync-aws backup
+  claude-codex-sync-aws init
+  claude-codex-sync-aws snapshots
+  claude-codex-sync-aws check
+  claude-codex-sync-aws restore TARGET_DIR [SNAPSHOT]
+  claude-codex-sync-aws doctor
+  claude-codex-sync-aws print-paths
+  claude-codex-sync-aws install-user-service
+  claude-codex-sync-aws uninstall-user-service
+
+Backs up raw Claude Code and Codex CLI session records to a restic repository,
+typically AWS S3. It creates restic snapshots; it does not mirror local deletes
+to old remote snapshots and never runs forget/prune automatically.
+USAGE
+}
+
+log() {
+  printf '%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" >&2
+}
+
+die() {
+  log "error: $*"
+  exit 1
+}
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"
+}
+
+load_env() {
+  if [[ -f "$ENV_FILE" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    . "$ENV_FILE"
+    set +a
+  fi
+}
+
+ensure_config_dir() {
+  install -d -m 0700 "$CONFIG_DIR" "$STATE_DIR"
+}
+
+derive_repository() {
+  if [[ -z "${RESTIC_REPOSITORY:-}" ]]; then
+    [[ -n "${AWS_S3_BUCKET:-}" ]] || die "set RESTIC_REPOSITORY or AWS_S3_BUCKET in $ENV_FILE"
+    local endpoint="${AWS_S3_ENDPOINT:-s3.amazonaws.com}"
+    local prefix="${RESTIC_REPOSITORY_PREFIX:-${APP_NAME}}"
+    prefix="${prefix#/}"
+    RESTIC_REPOSITORY="s3:${endpoint}/${AWS_S3_BUCKET}/${prefix}"
+  fi
+  export RESTIC_REPOSITORY
+}
+
+ensure_password_file() {
+  RESTIC_PASSWORD_FILE="${RESTIC_PASSWORD_FILE:-${CONFIG_DIR}/restic-password}"
+  export RESTIC_PASSWORD_FILE
+
+  if [[ ! -f "$RESTIC_PASSWORD_FILE" ]]; then
+    install -d -m 0700 "$(dirname "$RESTIC_PASSWORD_FILE")"
+    umask 077
+    if command -v openssl >/dev/null 2>&1; then
+      openssl rand -base64 48 >"$RESTIC_PASSWORD_FILE"
+    else
+      head -c 48 /dev/urandom | base64 >"$RESTIC_PASSWORD_FILE"
+    fi
+    log "generated restic password file: $RESTIC_PASSWORD_FILE"
+    log "keep this file safe; without it the backups cannot be restored"
+  fi
+}
+
+load_restic_config() {
+  load_env
+  ensure_config_dir
+  derive_repository
+  ensure_password_file
+}
+
+codex_home() {
+  printf '%s\n' "${CODEX_HOME:-$HOME/.codex}"
+}
+
+claude_home() {
+  printf '%s\n' "${CLAUDE_HOME:-$HOME/.claude}"
+}
+
+existing_paths() {
+  local path
+  for path in "$@"; do
+    [[ -e "$path" ]] && printf '%s\0' "$path"
+  done
+}
+
+sqlite_snapshot() {
+  local src_dir="$1"
+  local dst_dir="$2"
+  require_cmd python3
+  install -d -m 0700 "$dst_dir"
+
+  python3 - "$src_dir" "$dst_dir" <<'PY'
+import os
+import sqlite3
+import sys
+
+src_dir, dst_dir = sys.argv[1], sys.argv[2]
+names = [
+    "state_5.sqlite",
+    "logs_2.sqlite",
+    "goals_1.sqlite",
+    "memories_1.sqlite",
+]
+
+for name in names:
+    src = os.path.join(src_dir, name)
+    if not os.path.exists(src):
+        continue
+    dst = os.path.join(dst_dir, name)
+    uri = f"file:{src}?mode=ro"
+    try:
+        with sqlite3.connect(uri, uri=True) as source:
+            with sqlite3.connect(dst) as target:
+                source.backup(target)
+    except sqlite3.Error as exc:
+        raise SystemExit(f"sqlite backup failed for {src}: {exc}") from exc
+PY
+}
+
+build_staging_dir() {
+  local stage
+  stage="$(mktemp -d "${STATE_DIR}/stage.XXXXXX")"
+  sqlite_snapshot "$(codex_home)" "${stage}/codex-sqlite"
+  printf '%s\n' "$stage"
+}
+
+print_paths() {
+  local ch cx
+  cx="$(codex_home)"
+  ch="$(claude_home)"
+  cat <<EOF
+Codex paths:
+  ${cx}/sessions
+  ${cx}/history.jsonl
+  ${cx}/session_index.jsonl
+  ${cx}/attachments
+  ${cx}/memories
+  ${cx}/shell_snapshots
+  ${cx}/state_5.sqlite (snapshotted with Python sqlite backup API)
+  ${cx}/logs_2.sqlite (snapshotted with Python sqlite backup API)
+  ${cx}/goals_1.sqlite (snapshotted with Python sqlite backup API)
+  ${cx}/memories_1.sqlite (snapshotted with Python sqlite backup API)
+
+Claude paths:
+  ${ch}/projects
+  ${ch}/file-history
+  ${ch}/plans
+  ${ch}/commands
+  ${ch}/backups
+
+Intentionally not backed up:
+  ${cx}/auth.json
+  ${cx}/cache, ${cx}/tmp, ${cx}/.tmp, ${cx}/worktrees
+  ${ch}/cache, ${ch}/debug, ${ch}/downloads, ${ch}/paste-cache
+  ${HOME}/.claude.json (configuration; may contain sensitive MCP/provider data)
+EOF
+}
+
+init_repo() {
+  require_cmd restic
+  load_restic_config
+  restic init
+}
+
+ensure_repo_initialized() {
+  require_cmd restic
+  if restic snapshots >/dev/null 2>&1; then
+    return 0
+  fi
+  log "restic repository not initialized or not reachable; running restic init"
+  restic init
+}
+
+backup() {
+  require_cmd restic
+  require_cmd flock
+  load_restic_config
+
+  (
+    flock -n 9 || die "another ${APP_NAME} backup is already running"
+    ensure_repo_initialized
+
+    local stage cx ch
+    stage="$(build_staging_dir)"
+    trap 'rm -rf "$stage"' RETURN
+    cx="$(codex_home)"
+    ch="$(claude_home)"
+
+    local -a paths=()
+    while IFS= read -r -d '' path; do
+      paths+=("$path")
+    done < <(existing_paths \
+      "${cx}/sessions" \
+      "${cx}/history.jsonl" \
+      "${cx}/session_index.jsonl" \
+      "${cx}/attachments" \
+      "${cx}/memories" \
+      "${cx}/shell_snapshots" \
+      "${stage}/codex-sqlite" \
+      "${ch}/projects" \
+      "${ch}/file-history" \
+      "${ch}/plans" \
+      "${ch}/commands" \
+      "${ch}/backups")
+
+    ((${#paths[@]} > 0)) || die "no backup input paths exist"
+
+    log "starting restic backup to ${RESTIC_REPOSITORY}"
+    restic backup \
+      --tag "$APP_NAME" \
+      --tag "raw-agent-history" \
+      --tag "host=$(hostname -s)" \
+      "${paths[@]}"
+    log "backup completed"
+  ) 9>"$LOCK_FILE"
+}
+
+snapshots() {
+  require_cmd restic
+  load_restic_config
+  restic snapshots
+}
+
+check_repo() {
+  require_cmd restic
+  load_restic_config
+  restic check ${RESTIC_CHECK_ARGS:-}
+}
+
+restore_repo() {
+  require_cmd restic
+  load_restic_config
+  local target="${1:-}"
+  local snapshot="${2:-latest}"
+  [[ -n "$target" ]] || die "restore requires TARGET_DIR"
+  install -d -m 0700 "$target"
+  restic restore "$snapshot" --target "$target"
+}
+
+doctor() {
+  load_env
+  echo "config: $ENV_FILE"
+  echo "codex_home: $(codex_home)"
+  echo "claude_home: $(claude_home)"
+  if command -v restic >/dev/null 2>&1; then
+    restic version
+  else
+    echo "restic: missing"
+  fi
+  if command -v aws >/dev/null 2>&1; then
+    aws --version
+    aws sts get-caller-identity --output json >/dev/null 2>&1 \
+      && echo "aws_credentials: ok" \
+      || echo "aws_credentials: missing or invalid"
+  else
+    echo "aws: missing"
+  fi
+  if [[ -n "${RESTIC_REPOSITORY:-}" ]]; then
+    echo "restic_repository: ${RESTIC_REPOSITORY}"
+  elif [[ -n "${AWS_S3_BUCKET:-}" ]]; then
+    echo "aws_s3_bucket: ${AWS_S3_BUCKET}"
+    echo "restic_repository_prefix: ${RESTIC_REPOSITORY_PREFIX:-${APP_NAME}}"
+  else
+    echo "restic_repository: not configured"
+  fi
+  [[ -f "${RESTIC_PASSWORD_FILE:-${CONFIG_DIR}/restic-password}" ]] \
+    && echo "restic_password_file: present" \
+    || echo "restic_password_file: missing; backup will generate one"
+}
+
+write_env_template() {
+  local target="${1:-${CONFIG_DIR}/env}"
+  if [[ -f "$target" ]]; then
+    return 0
+  fi
+  install -d -m 0700 "$(dirname "$target")"
+  cat >"$target" <<'EOF'
+# claude-codex-sync-aws configuration.
+#
+# Use either RESTIC_REPOSITORY directly:
+# RESTIC_REPOSITORY=s3:s3.amazonaws.com/YOUR_BUCKET/claude-codex-sync-aws
+#
+# Or set AWS_S3_BUCKET and let the script derive the repository URL:
+# AWS_S3_BUCKET=YOUR_BUCKET
+# RESTIC_REPOSITORY_PREFIX=claude-codex-sync-aws
+
+# AWS credentials are intentionally not stored here by default.
+# Prefer `aws configure`, `aws sso login`, an instance profile, or a secrets manager.
+# If you do put static credentials here, chmod 600 this file.
+# AWS_ACCESS_KEY_ID=
+# AWS_SECRET_ACCESS_KEY=
+# AWS_SESSION_TOKEN=
+AWS_DEFAULT_REGION=us-east-1
+
+# Keep this file safe. If omitted, the script creates it on first backup.
+RESTIC_PASSWORD_FILE=${HOME}/.config/claude-codex-sync-aws/restic-password
+
+# Optional overrides:
+# CODEX_HOME=${HOME}/.codex
+# CLAUDE_HOME=${HOME}/.claude
+# RESTIC_CHECK_ARGS=--read-data-subset=1%
+EOF
+  chmod 0600 "$target"
+}
+
+install_user_service() {
+  install -d -m 0755 "$HOME/.local/bin" "$HOME/.config/systemd/user"
+  ensure_config_dir
+  install -m 0755 "$0" "$HOME/.local/bin/${APP_NAME}"
+  write_env_template "$ENV_FILE"
+
+  cat >"$HOME/.config/systemd/user/${APP_NAME}.service" <<EOF
+[Unit]
+Description=Back up Claude Code and Codex CLI chat history to AWS S3 with restic
+Documentation=https://github.com/yunwei37/${APP_NAME}
+
+[Service]
+Type=oneshot
+EnvironmentFile=-%h/.config/${APP_NAME}/env
+ExecStart=%h/.local/bin/${APP_NAME} backup
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+EOF
+
+  cat >"$HOME/.config/systemd/user/${APP_NAME}.timer" <<EOF
+[Unit]
+Description=Weekly Claude/Codex chat history backup
+
+[Timer]
+OnCalendar=Sun *-*-* 03:30:00
+Persistent=true
+RandomizedDelaySec=2h
+Unit=${APP_NAME}.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  systemctl --user daemon-reload
+  systemctl --user enable --now "${APP_NAME}.timer"
+  log "installed and enabled user timer: ${APP_NAME}.timer"
+  log "edit config before the first backup: $ENV_FILE"
+}
+
+uninstall_user_service() {
+  systemctl --user disable --now "${APP_NAME}.timer" >/dev/null 2>&1 || true
+  rm -f "$HOME/.config/systemd/user/${APP_NAME}.timer" \
+        "$HOME/.config/systemd/user/${APP_NAME}.service"
+  systemctl --user daemon-reload
+  log "removed user service and timer; left config and backups untouched"
+}
+
+main() {
+  local cmd="${1:-}"
+  case "$cmd" in
+    backup) shift; backup "$@" ;;
+    init) shift; init_repo "$@" ;;
+    snapshots) shift; snapshots "$@" ;;
+    check) shift; check_repo "$@" ;;
+    restore) shift; restore_repo "$@" ;;
+    doctor) shift; doctor "$@" ;;
+    print-paths) shift; print_paths "$@" ;;
+    install-user-service) shift; install_user_service "$@" ;;
+    uninstall-user-service) shift; uninstall_user_service "$@" ;;
+    -h|--help|help|"") usage ;;
+    *) usage >&2; exit 2 ;;
+  esac
+}
+
+main "$@"
