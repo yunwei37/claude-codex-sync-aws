@@ -1,5 +1,5 @@
 [Unit]
-Description=Back up Claude Code and Codex CLI chat history to AWS S3 with restic
+Description=Back up Claude Code and Codex CLI chat history to AWS S3
 Documentation=https://github.com/yunwei37/claude-codex-sync-aws
 
 [Service]

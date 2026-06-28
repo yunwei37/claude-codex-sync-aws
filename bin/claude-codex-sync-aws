@@ -14,15 +14,16 @@ Usage:
   claude-codex-sync-aws init
   claude-codex-sync-aws snapshots
   claude-codex-sync-aws check
-  claude-codex-sync-aws restore TARGET_DIR [SNAPSHOT]
+  claude-codex-sync-aws restore TARGET_DIR
   claude-codex-sync-aws doctor
   claude-codex-sync-aws print-paths
   claude-codex-sync-aws install-user-service
   claude-codex-sync-aws uninstall-user-service
 
-Backs up raw Claude Code and Codex CLI session records to a restic repository,
-typically AWS S3. It creates restic snapshots; it does not mirror local deletes
-to old remote snapshots and never runs forget/prune automatically.
+Backs up raw Claude Code and Codex CLI session records to AWS S3 without
+client-side encryption. Uploads are file-level incremental via aws s3 sync/cp.
+The script never passes --delete, so local deletes are not mirrored to S3.
+Enable S3 Versioning on the bucket to retain overwritten object versions.
 USAGE
 }
 
@@ -52,41 +53,6 @@ ensure_config_dir() {
   install -d -m 0700 "$CONFIG_DIR" "$STATE_DIR"
 }
 
-derive_repository() {
-  if [[ -z "${RESTIC_REPOSITORY:-}" ]]; then
-    [[ -n "${AWS_S3_BUCKET:-}" ]] || die "set RESTIC_REPOSITORY or AWS_S3_BUCKET in $ENV_FILE"
-    local endpoint="${AWS_S3_ENDPOINT:-s3.amazonaws.com}"
-    local prefix="${RESTIC_REPOSITORY_PREFIX:-${APP_NAME}}"
-    prefix="${prefix#/}"
-    RESTIC_REPOSITORY="s3:${endpoint}/${AWS_S3_BUCKET}/${prefix}"
-  fi
-  export RESTIC_REPOSITORY
-}
-
-ensure_password_file() {
-  RESTIC_PASSWORD_FILE="${RESTIC_PASSWORD_FILE:-${CONFIG_DIR}/restic-password}"
-  export RESTIC_PASSWORD_FILE
-
-  if [[ ! -f "$RESTIC_PASSWORD_FILE" ]]; then
-    install -d -m 0700 "$(dirname "$RESTIC_PASSWORD_FILE")"
-    umask 077
-    if command -v openssl >/dev/null 2>&1; then
-      openssl rand -base64 48 >"$RESTIC_PASSWORD_FILE"
-    else
-      head -c 48 /dev/urandom | base64 >"$RESTIC_PASSWORD_FILE"
-    fi
-    log "generated restic password file: $RESTIC_PASSWORD_FILE"
-    log "keep this file safe; without it the backups cannot be restored"
-  fi
-}
-
-load_restic_config() {
-  load_env
-  ensure_config_dir
-  derive_repository
-  ensure_password_file
-}
-
 codex_home() {
   printf '%s\n' "${CODEX_HOME:-$HOME/.codex}"
 }
@@ -95,11 +61,42 @@ claude_home() {
   printf '%s\n' "${CLAUDE_HOME:-$HOME/.claude}"
 }
 
-existing_paths() {
-  local path
-  for path in "$@"; do
-    [[ -e "$path" ]] && printf '%s\0' "$path"
-  done
+aws_args() {
+  local -a args=()
+  if [[ -n "${AWS_PROFILE:-}" ]]; then
+    args+=(--profile "$AWS_PROFILE")
+  fi
+  if [[ -n "${AWS_DEFAULT_REGION:-}" ]]; then
+    args+=(--region "$AWS_DEFAULT_REGION")
+  fi
+  printf '%s\0' "${args[@]}"
+}
+
+aws_cmd() {
+  local -a extra=()
+  while IFS= read -r -d '' arg; do
+    extra+=("$arg")
+  done < <(aws_args)
+  aws "${extra[@]}" "$@"
+}
+
+s3_prefix() {
+  local prefix="${AWS_S3_PREFIX:-${APP_NAME}/raw}"
+  prefix="${prefix#/}"
+  prefix="${prefix%/}"
+  printf '%s\n' "$prefix"
+}
+
+s3_base_uri() {
+  [[ -n "${AWS_S3_BUCKET:-}" ]] || die "set AWS_S3_BUCKET in $ENV_FILE"
+  printf 's3://%s/%s/%s\n' "$AWS_S3_BUCKET" "$(s3_prefix)" "$(hostname -s)"
+}
+
+load_aws_config() {
+  load_env
+  ensure_config_dir
+  require_cmd aws
+  require_cmd flock
 }
 
 sqlite_snapshot() {
@@ -175,85 +172,139 @@ Intentionally not backed up:
 EOF
 }
 
-init_repo() {
-  require_cmd restic
-  load_restic_config
-  restic init
+sync_dir() {
+  local src="$1"
+  local dst="$2"
+  [[ -d "$src" ]] || return 0
+  log "sync dir: $src -> $dst"
+  aws_cmd s3 sync "$src" "$dst" \
+    --no-follow-symlinks \
+    --only-show-errors \
+    --sse AES256
 }
 
-ensure_repo_initialized() {
-  require_cmd restic
-  if restic snapshots >/dev/null 2>&1; then
-    return 0
+copy_file() {
+  local src="$1"
+  local dst="$2"
+  [[ -f "$src" ]] || return 0
+  log "copy file: $src -> $dst"
+  aws_cmd s3 cp "$src" "$dst" \
+    --only-show-errors \
+    --sse AES256
+}
+
+write_manifest() {
+  local stage="$1"
+  local manifest="${stage}/manifest.json"
+  python3 - "$manifest" "$(codex_home)" "$(claude_home)" "$(hostname -s)" <<'PY'
+import datetime
+import json
+import os
+import sys
+
+manifest, codex_home, claude_home, host = sys.argv[1:5]
+now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+def exists(path):
+    return os.path.exists(os.path.expanduser(path))
+
+payload = {
+    "created_at": now,
+    "host": host,
+    "format": "raw-files-s3-sync-v1",
+    "encryption": "none-client-side",
+    "delete_behavior": "local deletes are not mirrored; aws s3 sync is run without --delete",
+    "codex_home": codex_home,
+    "claude_home": claude_home,
+    "paths": {
+        "codex_sessions": exists(os.path.join(codex_home, "sessions")),
+        "codex_history": exists(os.path.join(codex_home, "history.jsonl")),
+        "codex_state_sqlite": exists(os.path.join(codex_home, "state_5.sqlite")),
+        "codex_logs_sqlite": exists(os.path.join(codex_home, "logs_2.sqlite")),
+        "claude_projects": exists(os.path.join(claude_home, "projects")),
+        "claude_file_history": exists(os.path.join(claude_home, "file-history")),
+    },
+}
+
+with open(manifest, "w", encoding="utf-8") as f:
+    json.dump(payload, f, indent=2, sort_keys=True)
+    f.write("\n")
+PY
+  printf '%s\n' "$manifest"
+}
+
+init_repo() {
+  load_aws_config
+  [[ -n "${AWS_S3_BUCKET:-}" ]] || die "set AWS_S3_BUCKET in $ENV_FILE"
+  aws_cmd s3api head-bucket --bucket "$AWS_S3_BUCKET" >/dev/null
+  log "bucket is reachable: ${AWS_S3_BUCKET}"
+  if aws_cmd s3api get-bucket-versioning --bucket "$AWS_S3_BUCKET" | grep -q '"Status": "Enabled"'; then
+    log "bucket versioning is enabled"
+  else
+    log "warning: bucket versioning is not enabled; overwritten files may lose older versions"
   fi
-  log "restic repository not initialized or not reachable; running restic init"
-  restic init
 }
 
 backup() {
-  require_cmd restic
-  require_cmd flock
-  load_restic_config
+  load_aws_config
 
   (
     flock -n 9 || die "another ${APP_NAME} backup is already running"
-    ensure_repo_initialized
 
-    local stage cx ch
-    stage="$(build_staging_dir)"
-    trap 'rm -rf "$stage"' RETURN
+    local base cx ch stage manifest
+    base="$(s3_base_uri)"
     cx="$(codex_home)"
     ch="$(claude_home)"
+    stage="$(build_staging_dir)"
+    trap 'rm -rf "$stage"' RETURN
+    manifest="$(write_manifest "$stage")"
 
-    local -a paths=()
-    while IFS= read -r -d '' path; do
-      paths+=("$path")
-    done < <(existing_paths \
-      "${cx}/sessions" \
-      "${cx}/history.jsonl" \
-      "${cx}/session_index.jsonl" \
-      "${cx}/attachments" \
-      "${cx}/memories" \
-      "${cx}/shell_snapshots" \
-      "${stage}/codex-sqlite" \
-      "${ch}/projects" \
-      "${ch}/file-history" \
-      "${ch}/plans" \
-      "${ch}/commands" \
-      "${ch}/backups")
+    log "starting unencrypted file-level incremental backup to ${base}/"
+    sync_dir "${cx}/sessions" "${base}/codex/sessions/"
+    copy_file "${cx}/history.jsonl" "${base}/codex/history.jsonl"
+    copy_file "${cx}/session_index.jsonl" "${base}/codex/session_index.jsonl"
+    sync_dir "${cx}/attachments" "${base}/codex/attachments/"
+    sync_dir "${cx}/memories" "${base}/codex/memories/"
+    sync_dir "${cx}/shell_snapshots" "${base}/codex/shell_snapshots/"
+    sync_dir "${stage}/codex-sqlite" "${base}/codex/sqlite/"
 
-    ((${#paths[@]} > 0)) || die "no backup input paths exist"
+    sync_dir "${ch}/projects" "${base}/claude/projects/"
+    sync_dir "${ch}/file-history" "${base}/claude/file-history/"
+    sync_dir "${ch}/plans" "${base}/claude/plans/"
+    sync_dir "${ch}/commands" "${base}/claude/commands/"
+    sync_dir "${ch}/backups" "${base}/claude/backups/"
 
-    log "starting restic backup to ${RESTIC_REPOSITORY}"
-    restic backup \
-      --tag "$APP_NAME" \
-      --tag "raw-agent-history" \
-      --tag "host=$(hostname -s)" \
-      "${paths[@]}"
+    copy_file "$manifest" "${base}/manifests/latest.json"
+    copy_file "$manifest" "${base}/manifests/$(date -u '+%Y%m%dT%H%M%SZ').json"
     log "backup completed"
   ) 9>"$LOCK_FILE"
 }
 
 snapshots() {
-  require_cmd restic
-  load_restic_config
-  restic snapshots
+  load_aws_config
+  local base
+  base="$(s3_base_uri)"
+  aws_cmd s3 ls "${base}/manifests/"
 }
 
 check_repo() {
-  require_cmd restic
-  load_restic_config
-  restic check ${RESTIC_CHECK_ARGS:-}
+  load_aws_config
+  local base
+  base="$(s3_base_uri)"
+  init_repo
+  aws_cmd s3api list-objects-v2 \
+    --bucket "$AWS_S3_BUCKET" \
+    --prefix "$(s3_prefix)/$(hostname -s)/" \
+    --max-keys 1 >/dev/null
+  log "S3 prefix is reachable: ${base}/"
 }
 
 restore_repo() {
-  require_cmd restic
-  load_restic_config
+  load_aws_config
   local target="${1:-}"
-  local snapshot="${2:-latest}"
   [[ -n "$target" ]] || die "restore requires TARGET_DIR"
   install -d -m 0700 "$target"
-  restic restore "$snapshot" --target "$target"
+  aws_cmd s3 sync "$(s3_base_uri)/" "$target" --only-show-errors
 }
 
 doctor() {
@@ -261,30 +312,25 @@ doctor() {
   echo "config: $ENV_FILE"
   echo "codex_home: $(codex_home)"
   echo "claude_home: $(claude_home)"
-  if command -v restic >/dev/null 2>&1; then
-    restic version
-  else
-    echo "restic: missing"
-  fi
   if command -v aws >/dev/null 2>&1; then
     aws --version
-    aws sts get-caller-identity --output json >/dev/null 2>&1 \
-      && echo "aws_credentials: ok" \
-      || echo "aws_credentials: missing or invalid"
+    if aws_cmd sts get-caller-identity --output json >/dev/null 2>&1; then
+      echo "aws_credentials: ok"
+    else
+      echo "aws_credentials: missing or invalid"
+    fi
   else
     echo "aws: missing"
   fi
-  if [[ -n "${RESTIC_REPOSITORY:-}" ]]; then
-    echo "restic_repository: ${RESTIC_REPOSITORY}"
-  elif [[ -n "${AWS_S3_BUCKET:-}" ]]; then
-    echo "aws_s3_bucket: ${AWS_S3_BUCKET}"
-    echo "restic_repository_prefix: ${RESTIC_REPOSITORY_PREFIX:-${APP_NAME}}"
-  else
-    echo "restic_repository: not configured"
+  echo "aws_profile: ${AWS_PROFILE:-<default>}"
+  echo "aws_region: ${AWS_DEFAULT_REGION:-<default>}"
+  echo "aws_s3_bucket: ${AWS_S3_BUCKET:-<not configured>}"
+  if [[ -n "${AWS_S3_BUCKET:-}" ]]; then
+    echo "aws_s3_prefix: $(s3_prefix)"
+    echo "aws_s3_base_uri: $(s3_base_uri)/"
   fi
-  [[ -f "${RESTIC_PASSWORD_FILE:-${CONFIG_DIR}/restic-password}" ]] \
-    && echo "restic_password_file: present" \
-    || echo "restic_password_file: missing; backup will generate one"
+  echo "client_side_encryption: disabled"
+  echo "delete_behavior: no --delete; local deletes are not mirrored to S3"
 }
 
 write_env_template() {
@@ -295,29 +341,21 @@ write_env_template() {
   install -d -m 0700 "$(dirname "$target")"
   cat >"$target" <<'EOF'
 # claude-codex-sync-aws configuration.
-#
-# Use either RESTIC_REPOSITORY directly:
-# RESTIC_REPOSITORY=s3:s3.amazonaws.com/YOUR_BUCKET/claude-codex-sync-aws
-#
-# Or set AWS_S3_BUCKET and let the script derive the repository URL:
-# AWS_S3_BUCKET=YOUR_BUCKET
-# RESTIC_REPOSITORY_PREFIX=claude-codex-sync-aws
+AWS_S3_BUCKET=YOUR_BUCKET
+AWS_S3_PREFIX=claude-codex-sync-aws/raw
 
 # AWS credentials are intentionally not stored here by default.
 # Prefer `aws configure`, `aws sso login`, an instance profile, or a secrets manager.
 # If you do put static credentials here, chmod 600 this file.
+# AWS_PROFILE=
 # AWS_ACCESS_KEY_ID=
 # AWS_SECRET_ACCESS_KEY=
 # AWS_SESSION_TOKEN=
 AWS_DEFAULT_REGION=us-east-1
 
-# Keep this file safe. If omitted, the script creates it on first backup.
-RESTIC_PASSWORD_FILE=${HOME}/.config/claude-codex-sync-aws/restic-password
-
 # Optional overrides:
 # CODEX_HOME=${HOME}/.codex
 # CLAUDE_HOME=${HOME}/.claude
-# RESTIC_CHECK_ARGS=--read-data-subset=1%
 EOF
   chmod 0600 "$target"
 }
@@ -330,7 +368,7 @@ install_user_service() {
 
   cat >"$HOME/.config/systemd/user/${APP_NAME}.service" <<EOF
 [Unit]
-Description=Back up Claude Code and Codex CLI chat history to AWS S3 with restic
+Description=Back up Claude Code and Codex CLI chat history to AWS S3
 Documentation=https://github.com/yunwei37/${APP_NAME}
 
 [Service]

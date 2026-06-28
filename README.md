@@ -1,18 +1,33 @@
 # claude-codex-sync-aws
 
-Back up raw Claude Code and Codex CLI chat history to AWS S3 with
-[restic](https://restic.net/).
+Back up raw Claude Code and Codex CLI chat history to AWS S3 without
+client-side encryption.
 
-The goal is durable backup, not directory mirroring. If a local chat record is
-deleted later, older restic snapshots can still restore it. The script never
-runs `restic forget`, `restic prune`, or `aws s3 sync --delete`.
+The script uses `aws s3 sync` and `aws s3 cp` without `--delete`. That means:
 
-## Why restic, not borg?
+- new files are uploaded;
+- unchanged files are skipped by AWS CLI's normal sync logic;
+- changed files are uploaded again;
+- local deletes are not mirrored to S3;
+- with S3 Versioning enabled, overwritten object versions remain recoverable.
 
-Use `restic` for AWS S3. Restic supports S3 directly, encrypts data locally,
-deduplicates repeated content, and stores point-in-time snapshots. `borg` is
-excellent for SSH targets such as BorgBase, rsync.net, or a VPS, but it does not
-write directly to S3.
+This is a file-level incremental backup, not a tarball snapshot. It keeps the
+remote objects readable as normal S3 objects.
+
+## Tradeoffs
+
+This tool intentionally does not use restic encryption or a restic password.
+That makes restores simpler and keeps the backup layout transparent, but it
+also means anyone with S3 read access to the bucket can read the raw logs.
+
+File-level incremental backup is efficient for Claude/Codex JSONL session files,
+which are mostly append-only or newly created. Large sqlite files are copied from
+consistent Python sqlite snapshots and uploaded under stable S3 keys; if they
+change, AWS CLI uploads the whole sqlite snapshot, and S3 Versioning keeps the
+previous version.
+
+If you need chunk-level deduplication for large changing files, use restic or
+kopia instead; those tools require repository encryption passwords.
 
 ## What It Backs Up
 
@@ -40,14 +55,7 @@ directories, Codex worktrees, Claude paste caches, or `~/.claude.json`.
 
 ## Install
 
-Install restic first:
-
-```bash
-sudo apt-get update
-sudo apt-get install -y restic
-```
-
-Install the script and weekly user timer:
+Install AWS CLI v2 first, then install the weekly user timer:
 
 ```bash
 ./bin/claude-codex-sync-aws install-user-service
@@ -59,7 +67,10 @@ back.
 
 ## Configure AWS S3
 
-Create or choose a bucket, then configure:
+Create or choose a private bucket and enable S3 Versioning. Object Lock is
+optional.
+
+Configure:
 
 ```bash
 mkdir -p ~/.config/claude-codex-sync-aws
@@ -72,9 +83,9 @@ Minimum useful config:
 
 ```bash
 AWS_S3_BUCKET=your-bucket-name
-RESTIC_REPOSITORY_PREFIX=claude-codex-sync-aws
+AWS_S3_PREFIX=claude-codex-sync-aws/raw
 AWS_DEFAULT_REGION=us-east-1
-RESTIC_PASSWORD_FILE=${HOME}/.config/claude-codex-sync-aws/restic-password
+AWS_PROFILE=your-profile
 ```
 
 Set AWS credentials with one of:
@@ -84,43 +95,44 @@ Set AWS credentials with one of:
 - an instance profile or role
 - environment variables in the user service environment
 
-Avoid committing credentials or the restic password. If the password is lost,
-the backup cannot be restored.
-
 ## First Backup
 
 ```bash
 claude-codex-sync-aws doctor
+claude-codex-sync-aws check
 claude-codex-sync-aws backup
 claude-codex-sync-aws snapshots
 ```
 
-The first run initializes the restic repository if needed. Later runs are
-incremental.
-
 ## Restore
 
-Restore the latest snapshot into a scratch directory:
+Restore the current remote prefix into a scratch directory:
 
 ```bash
-claude-codex-sync-aws restore ~/restore-agent-history latest
+claude-codex-sync-aws restore ~/restore-agent-history
 ```
 
-List snapshots:
+For older overwritten versions, use the S3 console or `aws s3api
+list-object-versions` / `get-object --version-id ...`.
 
-```bash
-claude-codex-sync-aws snapshots
+## S3 Layout
+
+Objects are written under:
+
+```text
+s3://$AWS_S3_BUCKET/$AWS_S3_PREFIX/$HOST/
 ```
 
-## S3 Object Lock
+Example:
 
-For stronger protection against accidental or malicious deletion, create the S3
-bucket with versioning and Object Lock before the first backup. Object Lock
-configuration is intentionally left outside this script because compliance-mode
-retention is hard to undo during the retention window.
-
-The script itself only creates new restic snapshots. It does not delete older
-snapshots.
+```text
+codex/sessions/...
+codex/history.jsonl
+codex/sqlite/logs_2.sqlite
+claude/projects/...
+manifests/latest.json
+manifests/20260628T064500Z.json
+```
 
 ## Operations
 
